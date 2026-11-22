@@ -1,13 +1,16 @@
+//app/src/main/java/com/example/appmonitor/MainActivity.kt//
 package com.example.appmonitor
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
-import android.view.accessibility.AccessibilityManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
@@ -15,13 +18,31 @@ import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONObject
-import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var permissionLayout: LinearLayout
     private lateinit var switchAccessibility: Switch
     private lateinit var switchBattery: Switch
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var isMonitoring = false
+
+    private val serverConfigUrl = "https://app-control-server-54oe.onrender.com/api/config"
+
+    private val checkTaskRunnable = object : Runnable {
+        override fun run() {
+            if (isMonitoring) {
+                if (isAnotherAppLaunched()) {
+                    finishAndRemoveTask()
+                } else {
+                    handler.postDelayed(this, 1000)
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,7 +74,6 @@ class MainActivity : AppCompatActivity() {
         }
         permissionLayout.addView(titleTextView)
 
-        // Accessibility Row
         val rowAccessibility = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -84,7 +104,6 @@ class MainActivity : AppCompatActivity() {
         rowAccessibility.addView(switchAccessibility)
         permissionLayout.addView(rowAccessibility)
 
-        // Battery Optimization Row
         val rowBattery = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -133,6 +152,14 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         checkAndLoadApp()
+        isMonitoring = true
+        handler.post(checkTaskRunnable)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        isMonitoring = false
+        handler.removeCallbacks(checkTaskRunnable)
     }
 
     private fun checkAndLoadApp() {
@@ -153,7 +180,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
-        val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
         val enabledServices = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
         val expectedService = "$packageName/${MonitorAccessibilityService::class.java.name}"
         val expectedServiceSimple = "$packageName/.MonitorAccessibilityService"
@@ -181,15 +207,42 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadServerConfig() {
-        try {
-            val inputStream: InputStream = assets.open("server.json")
-            val jsonString = inputStream.bufferedReader().use { it.readText() }
-            val jsonObject = JSONObject(jsonString)
-            val webUrl = jsonObject.getString("urlweb")
-            webView.loadUrl(webUrl)
-        } catch (e: Exception) {
-            e.printStackTrace()
+    private fun isAnotherAppLaunched(): Boolean {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val tasks = activityManager.getRunningTasks(1)
+        if (tasks.isNotEmpty()) {
+            val topActivity = tasks[0].topActivity
+            val currentPackage = topActivity?.packageName
+            if (currentPackage != null && currentPackage != packageName && currentPackage != "com.android.systemui") {
+                return true
+            }
         }
+        return false
+    }
+
+    private fun loadServerConfig() {
+        Thread {
+            try {
+                val url = URL(serverConfigUrl)
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 10000
+                conn.readTimeout = 10000
+                
+                val responseString = conn.inputStream.bufferedReader().use { it.readText() }
+                val jsonObject = JSONObject(responseString)
+                val webUrl = jsonObject.getString("urlweb")
+                
+                runOnUiThread {
+                    webView.loadUrl(webUrl)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                // که تېروتنه وشوه، د خوندیتوب لپاره یو ډیفالت لینک لود کړه تر څو صفحه سپینه پاتې نشي
+                runOnUiThread {
+                    webView.loadUrl("https://www.google.com")
+                }
+            }
+        }.start()
     }
 }
